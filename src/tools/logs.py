@@ -1,12 +1,33 @@
 """Log analysis tools for pfSense MCP server."""
 
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from ..helpers import VALID_LOG_TYPES, parse_filterlog_entry, validate_ip_address
 from ..models import QueryFilter
 from ..server import get_api_client, logger, mcp
 from mcp.types import ToolAnnotations
+
+# SIP signaling ports. RTP (10000-20000) and STUN (3478) are checked via range test.
+_SIP_PORTS = {"5060", "5061"}
+_STUN_PORTS = {"3478"}
+_RTP_LOW = 10000
+_RTP_HIGH = 20000
+
+
+def _classify_voip_port(port: str) -> Optional[str]:
+    """Return VOIP traffic type for a port string, or None if not VOIP."""
+    if port in _SIP_PORTS:
+        return "SIP"
+    if port in _STUN_PORTS:
+        return "STUN/TURN"
+    try:
+        p = int(port)
+        if _RTP_LOW <= p <= _RTP_HIGH:
+            return "RTP"
+    except ValueError:
+        pass
+    return None
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))
@@ -189,6 +210,113 @@ async def analyze_blocked_traffic(
         }
     except Exception as e:
         logger.error(f"Failed to analyze blocked traffic: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))
+async def analyze_voip_sessions(
+    lines: int = 50,
+    interface: Optional[str] = None,
+) -> Dict:
+    """Analyze firewall logs for VOIP traffic patterns to diagnose call dropouts.
+
+    Scans the firewall log for SIP signaling (UDP 5060/5061), RTP media
+    (UDP 10000-20000), and STUN/TURN WebRTC traffic (UDP 3478), then surfaces:
+    - Pass vs block counts per traffic type
+    - Blocked VOIP entries (the most common cause of random call dropouts)
+    - A timeline of VOIP log events for correlation with reported outage windows
+
+    Firewall logging for VOIP traffic must be enabled on your pass rules (or on
+    the VOIP floating rules created by setup_voip_qos) for entries to appear here.
+    If blocked counts are zero and calls still drop, the issue is likely network
+    congestion upstream of pfSense — use setup_voip_qos to prioritize the traffic.
+
+    Args:
+        lines: Number of recent log lines to scan (max 50)
+        interface: Optional interface filter (wan, lan, etc.)
+    """
+    client = get_api_client()
+    try:
+        safe_lines = max(1, min(lines, 50))
+        logs = await client.get_firewall_logs(lines=safe_lines)
+        entries = logs.get("data") or []
+
+        voip_entries: List[Dict] = []
+        blocked_voip: List[Dict] = []
+        type_counts: Dict[str, Dict[str, int]] = {}
+
+        for entry in entries:
+            text = entry.get("text", "")
+            parsed = parse_filterlog_entry(text)
+            if not parsed:
+                continue
+
+            if interface and parsed.get("interface", "").lower() != interface.lower():
+                continue
+
+            # Check source and destination ports for VOIP classification
+            voip_type = _classify_voip_port(parsed.get("dst_port", "")) or \
+                        _classify_voip_port(parsed.get("src_port", ""))
+            if not voip_type:
+                continue
+
+            action = parsed.get("action", "pass").lower()
+            record = {
+                "voip_type": voip_type,
+                "action": action,
+                "interface": parsed.get("interface"),
+                "protocol": parsed.get("protocol"),
+                "src_ip": parsed.get("src_ip"),
+                "src_port": parsed.get("src_port"),
+                "dst_ip": parsed.get("dst_ip"),
+                "dst_port": parsed.get("dst_port"),
+                "raw": text[:200],
+            }
+            voip_entries.append(record)
+
+            if voip_type not in type_counts:
+                type_counts[voip_type] = {"pass": 0, "block": 0, "other": 0}
+            bucket = action if action in ("pass", "block") else "other"
+            type_counts[voip_type][bucket] += 1
+
+            if action in ("block", "reject"):
+                blocked_voip.append(record)
+
+        has_blocks = len(blocked_voip) > 0
+        diagnosis = []
+        if has_blocks:
+            diagnosis.append(
+                f"{len(blocked_voip)} VOIP packet(s) were BLOCKED — this is a likely "
+                "cause of call dropouts. Check your firewall rules and ensure VOIP "
+                "traffic is permitted on the relevant interfaces."
+            )
+        if not voip_entries:
+            diagnosis.append(
+                "No VOIP log entries found. Either VOIP traffic was not logged "
+                "(enable 'log' on your VOIP pass rules or use setup_voip_qos) or "
+                "no VOIP calls occurred in the sampled window."
+            )
+        if voip_entries and not has_blocks:
+            diagnosis.append(
+                "All logged VOIP traffic was passed. If calls still drop, the cause "
+                "is likely upstream congestion — use setup_voip_qos to prioritize "
+                "SIP/RTP traffic and prevent other traffic from starving calls."
+            )
+
+        return {
+            "success": True,
+            "lines_scanned": safe_lines,
+            "interface_filter": interface,
+            "voip_entries_found": len(voip_entries),
+            "blocked_voip_count": len(blocked_voip),
+            "traffic_type_summary": type_counts,
+            "blocked_entries": blocked_voip,
+            "all_voip_entries": voip_entries,
+            "diagnosis": diagnosis,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Failed to analyze VOIP sessions: {e}")
         return {"success": False, "error": str(e)}
 
 

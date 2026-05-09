@@ -553,6 +553,118 @@ async def bulk_block_ips(
     return response
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+@rate_limited
+async def create_floating_rule(
+    interfaces: List[str],
+    rule_type: str,
+    protocol: str,
+    source: str,
+    destination: str,
+    direction: str = "any",
+    description: Optional[str] = None,
+    source_port: Optional[str] = None,
+    destination_port: Optional[str] = None,
+    queue: Optional[str] = None,
+    ackqueue: Optional[str] = None,
+    quick: bool = True,
+    disabled: bool = False,
+    log_matches: bool = True,
+    apply_immediately: bool = True,
+) -> Dict:
+    """Create a floating firewall rule — used to assign traffic to QoS queues or
+    policy-route across multiple interfaces.
+
+    Floating rules are evaluated before interface rules and can match multiple
+    interfaces in a single rule. The ``queue`` and ``ackqueue`` parameters assign
+    matched traffic to HFSC/CBQ/PRIQ shaper queues, which is the standard way to
+    implement VOIP prioritization in pfSense.
+
+    Args:
+        interfaces: List of interfaces this rule applies to (e.g. ["wan", "lan"])
+        rule_type: Action (pass, block, reject)
+        protocol: Protocol (tcp, udp, tcp/udp, icmp, any)
+        source: Source address (any, IP, network, alias name)
+        destination: Destination address (any, IP, network, alias name)
+        direction: Traffic direction (in, out, any). Floating rules require this.
+        description: Optional rule description
+        source_port: Source port — single (443), range (1024-65535), or alias
+        destination_port: Destination port — single (443), range (1024-65535), or alias
+        queue: Shaper queue name for matched traffic (e.g. "qVOIP")
+        ackqueue: Shaper queue name for ACK packets (e.g. "qACK"). Reduces ACK
+                  flooding that can starve upstream queues.
+        quick: If True, stop evaluating further rules on match (recommended for QoS)
+        disabled: Create rule in disabled state
+        log_matches: Whether to log packets matching this rule
+        apply_immediately: Whether to apply changes to the running firewall
+    """
+    client = get_api_client()
+
+    if rule_type not in ("pass", "block", "reject"):
+        return {"success": False, "error": f"Invalid rule_type '{rule_type}'. Must be: pass, block, reject"}
+
+    if protocol.lower() not in ("tcp", "udp", "tcp/udp", "icmp", "any"):
+        return {"success": False, "error": f"Invalid protocol '{protocol}'. Must be: tcp, udp, tcp/udp, icmp, any"}
+
+    if direction not in ("in", "out", "any"):
+        return {"success": False, "error": f"Invalid direction '{direction}'. Must be: in, out, any"}
+
+    for port_param, port_val in [("source_port", source_port), ("destination_port", destination_port)]:
+        if port_val:
+            port_error = validate_port_value(port_val, port_param)
+            if port_error:
+                return {"success": False, "error": port_error}
+
+    rule_data: Dict = {
+        "interface": interfaces,
+        "floating": True,
+        "direction": direction,
+        "type": rule_type,
+        "ipprotocol": "inet",
+        "source": source,
+        "destination": destination,
+        "descr": sanitize_description(description) if description else f"Floating rule via MCP at {datetime.now(timezone.utc).isoformat()}",
+        "log": log_matches,
+        "statetype": "keep state",
+        "disabled": disabled,
+        "quick": quick,
+    }
+
+    if protocol.lower() == "any":
+        rule_data["protocol"] = None
+    else:
+        rule_data["protocol"] = protocol
+
+    if source_port:
+        rule_data["source_port"] = source_port
+    if destination_port:
+        rule_data["destination_port"] = destination_port
+    if queue:
+        rule_data["defaultqueue"] = queue
+    if ackqueue:
+        rule_data["ackqueue"] = ackqueue
+
+    try:
+        control = ControlParameters(apply=apply_immediately)
+        result = await client.create_firewall_rule(rule_data, control)
+
+        return {
+            "success": True,
+            "message": "Floating firewall rule created",
+            "rule": result.get("data", result),
+            "interfaces": interfaces,
+            "direction": direction,
+            "queue": queue,
+            "ackqueue": ackqueue,
+            "applied_immediately": apply_immediately,
+            "links": client.extract_links(result),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Failed to create floating rule: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
 async def apply_firewall_changes() -> Dict:
     """Force apply pending firewall changes and recompile the pf ruleset.
