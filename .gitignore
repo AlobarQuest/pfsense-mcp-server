@@ -62,6 +62,10 @@ logs/
 *.log
 log/
 
+# VPN credentials and configs
+*.ovpn
+NordVPN*
+
 # Data and backups
 data/
 backups/
